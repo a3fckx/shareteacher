@@ -1,0 +1,9 @@
+# ShareTeacher browser_agent sidecar — pinned deps.
+# browser-use 0.13.x is 100% CDP (Playwright was dropped), so NO
+# playwright/chromium install is needed: the sidecar only ATTACHES to the
+# remote Kernel browser over its CDP websocket url.
+#
+# openai / httpx / pydantic / cdp-use are pulled in transitively by browser-use.
+browser-use==0.13.1
+fastapi==0.115.6
+uvicorn[standard]==0.34.0

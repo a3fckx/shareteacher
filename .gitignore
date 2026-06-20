@@ -1,0 +1,23 @@
+node_modules/
+.next/
+out/
+.env
+.env.local
+.env*.local
+*.log
+.DS_Store
+.drizzle/
+drizzle/meta/_journal_backup*
+coverage/
+*.tsbuildinfo
+.pgdata/
+qa/artifacts/
+
+# Python sidecar (browser_agent)
+browser_agent/.venv/
+**/__pycache__/
+*.pyc
+.venv/
+
+# tooling
+.commandcode/

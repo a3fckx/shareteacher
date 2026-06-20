@@ -1,0 +1,85 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html,
+body {
+  background: #0b0d12;
+  color: #e7ecf3;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+/* ── Avatar annotation overlays (GPU-cheap: transform / opacity / dashoffset). ─
+   Animating only these keeps the Recall webpage-camera capture framerate stable. */
+@keyframes annFade {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+@keyframes annPop {
+  0% {
+    opacity: 0;
+    transform: scale(0.86);
+  }
+  60% {
+    transform: scale(1.04);
+  }
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+@keyframes annFadeUp {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+@keyframes annDraw {
+  to {
+    stroke-dashoffset: 0;
+  }
+}
+/* Live-audio equalizer bars in the avatar widget. */
+@keyframes annEq {
+  0%,
+  100% {
+    transform: scaleY(0.3);
+  }
+  50% {
+    transform: scaleY(1);
+  }
+}
+.ann-fade {
+  animation: annFade 0.25s ease-out both;
+}
+.ann-pop {
+  animation: annPop 0.32s cubic-bezier(0.2, 0.8, 0.2, 1) both;
+}
+.ann-fade-up {
+  animation: annFadeUp 0.3s cubic-bezier(0.2, 0.8, 0.2, 1) both;
+}
+.ann-arrow {
+  animation: annDraw 0.45s ease-out forwards;
+}
+@media (prefers-reduced-motion: reduce) {
+  .ann-fade,
+  .ann-pop,
+  .ann-fade-up,
+  .ann-arrow {
+    animation: none;
+  }
+  .ann-arrow {
+    stroke-dashoffset: 0 !important;
+  }
+}
