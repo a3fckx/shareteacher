@@ -19,8 +19,13 @@
 import type {
   BrowserController,
   BrowserSessionInfo,
+  ComposeRequest,
+  ComposeResponse,
+  DirectRequest,
+  DirectResponse,
   Env,
   ObserveResult,
+  PilotResult,
 } from "@/types/contracts";
 import {
   allowlistFromEnv,
@@ -32,6 +37,11 @@ import {
 // open-ended browser-use agent run can take many model+browser round trips.
 const DEFAULT_TIMEOUT_MS = 30_000;
 const TASK_TIMEOUT_MS = 180_000;
+// DSPy director/compose LM round trips: a few seconds typically (gpt-4.1-mini,
+// ChainOfThought + optional ScreenInterpreter), but give generous headroom.
+const DIRECT_TIMEOUT_MS = 60_000;
+// BrowserPilot (ReAct) drives several browser+LM steps — same budget as task().
+const PILOT_TIMEOUT_MS = TASK_TIMEOUT_MS;
 // The screenshot-stream frame must be quick; a slow capture is dropped (the
 // stream keeps showing the previous frame) rather than stalling the loop.
 const FRAME_TIMEOUT_MS = 8_000;
@@ -215,6 +225,43 @@ export function createRealBrowserController(env: Env): BrowserController {
         // only by the Kernel runtime's DELETE, not by us.
         session = null;
       }
+    },
+
+    // ── DSPy intelligence (same sidecar, /intelligence/* routes) ─────────────
+    // The DSPy brain lives in the SAME browser_agent sidecar (it reuses the live
+    // CDP browser + the OpenAI key that never leaves the server). We proxy to its
+    // /intelligence/{direct,compose,pilot} routes. The director's chosen
+    // ui_action comes back to the orchestrator, which actuates it through the
+    // existing tool registry / StageEvent emitters — the brain only CHOOSES.
+
+    async direct(req: DirectRequest): Promise<DirectResponse> {
+      // The request body matches service.py's DirectRequest exactly. The
+      // sessionId on the body is the brain's session key; we keep it as the
+      // caller passed it (already the orchestrator's sessionId).
+      return call<DirectResponse>(
+        "POST",
+        "/intelligence/direct",
+        req,
+        DIRECT_TIMEOUT_MS,
+      );
+    },
+
+    async compose(req: ComposeRequest): Promise<ComposeResponse> {
+      return call<ComposeResponse>(
+        "POST",
+        "/intelligence/compose",
+        req,
+        DIRECT_TIMEOUT_MS,
+      );
+    },
+
+    async pilot(goal: string, allowlist: string[] = []): Promise<PilotResult> {
+      return call<PilotResult>(
+        "POST",
+        "/intelligence/pilot",
+        { session_id: sessionId(), goal, allowlist },
+        PILOT_TIMEOUT_MS,
+      );
     },
   };
 }

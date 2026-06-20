@@ -34,6 +34,11 @@ from pydantic import BaseModel
 # package to start — that is intentional for a real-only sidecar.
 from browser_use import Agent, Browser, ChatOpenAI
 
+# DSPy intelligence layer (the brain). It mounts its own /intelligence/* router
+# (/direct, /compose, /interpret, /pilot); main.py injects the live-browser
+# runners so the brain stays browser-agnostic and main.py owns the CDP hands.
+import intelligence
+
 
 # ── per-session browser handle ──────────────────────────────────────────────
 # One Kernel browser per sessionId. A per-handle asyncio.Lock serializes agent
@@ -41,9 +46,14 @@ from browser_use import Agent, Browser, ChatOpenAI
 
 
 class Handle:
-    def __init__(self, browser: "Browser") -> None:
+    def __init__(
+        self, browser: "Browser", allowed_domains: Optional[list[str]] = None
+    ) -> None:
         self.browser = browser
         self.lock = asyncio.Lock()
+        # The lesson allowlist (mirrors the Kernel browser's allowed_domains).
+        # BrowserPilot enforces it again inside its navigate tool.
+        self.allowed_domains: list[str] = list(allowed_domains or [])
 
 
 SESSIONS: dict[str, Handle] = {}
@@ -167,7 +177,7 @@ async def create_session(req: SessionReq) -> dict[str, Any]:
         allowed_domains=req.allowedDomains or None,
     )
     await browser.start()
-    SESSIONS[req.sessionId] = Handle(browser)
+    SESSIONS[req.sessionId] = Handle(browser, allowed_domains=req.allowedDomains)
     return {"ok": True, "sessionId": req.sessionId}
 
 
@@ -200,15 +210,28 @@ async def open_url(req: OpenReq) -> dict[str, Any]:
     return {"ok": True, "url": req.url}
 
 
-@app.get("/observe")
-async def observe(sessionId: str = "default") -> dict[str, Any]:
-    handle = _handle(sessionId)
+def _selector_map(state: Any) -> dict[int, Any]:
+    """Interactive-element map. In browser-use 0.13.x it lives on `dom_state`,
+    NOT on the top-level BrowserStateSummary — reading the old top-level path
+    silently returned {} (the bug that starved the brain of elements)."""
+    dom_state = getattr(state, "dom_state", None)
+    if dom_state is not None:
+        sm = getattr(dom_state, "selector_map", None)
+        if sm:
+            return sm
+    return getattr(state, "selector_map", {}) or {}
+
+
+async def _read_observation(handle: Handle) -> dict[str, Any]:
+    """Compact observation of the current page: url, title, [ref] elements, text.
+    Takes the handle lock; shared by GET /observe and the /interpret runner."""
     async with handle.lock:
-        state = await handle.browser.get_browser_state_summary()
+        state = await handle.browser.get_browser_state_summary(
+            include_screenshot=False
+        )
 
     elements: list[dict[str, str]] = []
-    selector_map = getattr(state, "selector_map", {}) or {}
-    for idx, node in list(selector_map.items())[:40]:
+    for idx, node in list(_selector_map(state).items())[:40]:
         text = _node_text(node)
         if text:
             elements.append(
@@ -233,6 +256,12 @@ async def observe(sessionId: str = "default") -> dict[str, Any]:
         "elements": elements,
         "text": page_text[:8000],
     }
+
+
+@app.get("/observe")
+async def observe(sessionId: str = "default") -> dict[str, Any]:
+    handle = _handle(sessionId)
+    return await _read_observation(handle)
 
 
 @app.post("/click")
@@ -330,6 +359,45 @@ async def stop(req: StopReq) -> dict[str, Any]:
         except Exception:
             pass
     return {"ok": True}
+
+
+# ── DSPy intelligence wiring ─────────────────────────────────────────────────
+# The brain's routes live under /intelligence/* (mounted below). The pure-LM
+# routes (/direct, /compose) need nothing from main.py; the browser-bound routes
+# (/pilot, /interpret) call the two runners injected here, so the brain never
+# touches a Handle directly and main.py keeps sole ownership of the CDP browser.
+
+
+async def _pilot_runner(
+    session_id: str, goal: str, allowlist: list[str]
+) -> dict[str, Any]:
+    """Run BrowserPilot (dspy.ReAct) over the session's LIVE CDP browser.
+
+    Reuses the existing attached BrowserSession — never constructs a new one —
+    and serializes on the handle lock (the /frame stream stays lock-free, so the
+    always-on screenshot keeps flowing while the pilot works)."""
+    handle = _handle(session_id)
+    allowed = allowlist or handle.allowed_domains
+    async with handle.lock:
+        pilot = intelligence.BrowserPilot(handle.browser, allowed, max_iters=8)
+        pred = await pilot.aforward(goal)
+    outcome = str(getattr(pred, "outcome", "") or "")
+    return {
+        "outcome": outcome,
+        "success": bool(getattr(pred, "success", False)),
+        "steps": intelligence.count_pilot_steps(pred),
+        "result": outcome,
+    }
+
+
+async def _observe_runner(session_id: str) -> dict[str, Any]:
+    """Read the live page for /interpret (same shape as GET /observe)."""
+    return await _read_observation(_handle(session_id))
+
+
+app.include_router(intelligence.router)
+intelligence.set_pilot_runner(_pilot_runner)
+intelligence.set_observe_runner(_observe_runner)
 
 
 if __name__ == "__main__":

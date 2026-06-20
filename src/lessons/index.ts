@@ -125,6 +125,19 @@ class InMemoryLessonEngine implements LessonEngine {
     return this.snapshot(state);
   }
 
+  complete(sessionId: string): LessonRunState | undefined {
+    const state = this.states.get(sessionId);
+    if (!state) return undefined;
+    const lesson = this.get(state.lessonId);
+    // Clamp to the final step and flip done — the director loop ends on the
+    // director's own `done`/budget, not by walking the fixed steps.
+    if (lesson && lesson.steps.length > 0) {
+      state.stepIndex = lesson.steps.length - 1;
+    }
+    state.done = true;
+    return this.snapshot(state);
+  }
+
   answer(sessionId: string, response: string): { passed: boolean; feedback: string } {
     const step = this.currentStep(sessionId);
     if (!step) {
@@ -156,11 +169,31 @@ class InMemoryLessonEngine implements LessonEngine {
   }
 
   isAllowed(sessionId: string, url: string): boolean {
+    // Prefer the current step's allowlist (legacy step loop); otherwise fall back
+    // to the lesson-level allowlist (director loop, which never walks steps).
     const step = this.currentStep(sessionId);
-    const allow = step?.allowlist;
-    // No active step or no allowlist on the step => allow everything.
+    const allow =
+      step?.allowlist && step.allowlist.length > 0
+        ? step.allowlist
+        : this.allowlistFor(sessionId);
+    // No allowlist anywhere => allow everything.
     if (!allow || allow.length === 0) return true;
     return domainAllowed(url, allow);
+  }
+
+  allowlistFor(sessionId: string): string[] {
+    const state = this.states.get(sessionId);
+    const lesson = state ? this.get(state.lessonId) : undefined;
+    if (!lesson) return [];
+    if (lesson.allowlist && lesson.allowlist.length > 0) {
+      return [...lesson.allowlist];
+    }
+    // Older lessons without a lesson-level allowlist: union of step allowlists.
+    const union = new Set<string>();
+    for (const s of lesson.steps) {
+      for (const d of s.allowlist ?? []) union.add(d);
+    }
+    return [...union];
   }
 
   // ── internals ──────────────────────────────────────────────────────────

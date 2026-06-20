@@ -185,6 +185,11 @@ export function buildPptLesson(topic: string = DEFAULT_PPT_TOPIC): Lesson {
     },
   ];
 
+  // Curriculum = the lesson's milestones for the DSPy TeachingDirector (the
+  // destination/beats, NOT a rigid script). Derived from the step titles so the
+  // director and the legacy step fallback never drift.
+  const curriculum = steps.map((s) => s.title);
+
   return {
     id: PPT_LESSON_ID,
     title: "Create a PPT using ChatGPT",
@@ -193,6 +198,8 @@ export function buildPptLesson(topic: string = DEFAULT_PPT_TOPIC): Lesson {
       "with feedback, and export a reusable .pptx plus a prompt template.",
     personaPrompt: PERSONA_PROMPT,
     knowledgeBase: KNOWLEDGE_BASE,
+    curriculum,
+    allowlist,
     steps,
   };
 }

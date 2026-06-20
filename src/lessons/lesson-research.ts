@@ -119,6 +119,9 @@ export function buildResearchLesson(topic: string = DEFAULT_RESEARCH_TOPIC): Les
     },
   ];
 
+  // Curriculum = milestones for the DSPy TeachingDirector (guidance, not steps).
+  const curriculum = steps.map((s) => s.title);
+
   return {
     id: RESEARCH_LESSON_ID,
     title: "Research with YouTube + ChatGPT",
@@ -127,6 +130,8 @@ export function buildResearchLesson(topic: string = DEFAULT_RESEARCH_TOPIC): Les
       "in ChatGPT — and save a reusable synthesis prompt.",
     personaPrompt: PERSONA_PROMPT,
     knowledgeBase: KNOWLEDGE_BASE,
+    curriculum,
+    allowlist,
     steps,
   };
 }

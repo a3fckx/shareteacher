@@ -86,6 +86,9 @@ export function buildImageLesson(): Lesson {
     },
   ];
 
+  // Curriculum = milestones for the DSPy TeachingDirector (guidance, not steps).
+  const curriculum = steps.map((s) => s.title);
+
   return {
     id: IMAGE_LESSON_ID,
     title: "Write a great image prompt",
@@ -93,6 +96,8 @@ export function buildImageLesson(): Lesson {
       "Teach a learner the five layers of a strong image prompt and save a reusable template.",
     personaPrompt: PERSONA_PROMPT,
     knowledgeBase: KNOWLEDGE_BASE,
+    curriculum,
+    allowlist,
     steps,
   };
 }

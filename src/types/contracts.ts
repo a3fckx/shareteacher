@@ -93,7 +93,15 @@ export type StageEvent =
   | { type: "browser_view"; liveUrl: string }
   | { type: "takeover"; url: string; reason: string }
   | { type: "artifact"; kind: string; name: string; url: string }
-  | { type: "status"; phase: SessionPhase; detail?: string };
+  | { type: "status"; phase: SessionPhase; detail?: string }
+  // ADDITIVE (director-driven overlays). The DSPy TeachingDirector can choose an
+  // on-stage overlay verb (zoom/spotlight/arrow/circle/caption/share_screen/
+  // take_control/scroll_to/clear_overlay) and the orchestrator emits it
+  // DETERMINISTICALLY — no longer waiting on GWM-1 to call the matching client
+  // tool. The existing reducer (stage-state.ts) ignores unknown event types via
+  // its `default` branch, so this is non-breaking; a UI handler that routes this
+  // through the same overlay path as `useClientEvent` is a separate UI track.
+  | { type: "ui_action"; tool: string; args: Record<string, unknown> };
 
 export interface Box {
   x: number;
@@ -180,6 +188,127 @@ export interface BrowserRuntime extends AdapterMeta {
   stopSession(sessionId: string): Promise<void>;
 }
 
+// ── DSPy intelligence wire contract (Next orchestrator ↔ Python sidecar) ───
+// The brain runs in the browser_agent sidecar (DSPy + OpenAI). The orchestrator
+// is DIRECTOR-DRIVEN: each turn it POSTs /intelligence/direct with the lesson
+// goal + current screen + the last student message + a short history and gets
+// back { narration, ui_action }. It executes the single ui_action through its
+// existing tool registry / StageEvent emitters (so the StageEvent + ToolName
+// contracts stay intact — the brain only CHOOSES, the orchestrator ACTS), feeds
+// the narration to the avatar as grounded context, and loops until the director
+// returns `done` or the bounded turn budget is spent. These shapes MUST mirror
+// browser_agent/intelligence/service.py (the Pydantic request/response models).
+
+/** The closed action vocabulary the director may choose from (== signatures.py UI_TOOLS). */
+export type UiActionTool =
+  // stage / overlay
+  | "caption"
+  | "highlight"
+  | "zoom"
+  | "spotlight"
+  | "arrow"
+  | "circle"
+  | "share_screen"
+  | "take_control"
+  | "scroll_to"
+  | "clear_overlay"
+  | "show_output"
+  | "write_prompt"
+  // browser actuation
+  | "navigate"
+  | "click"
+  | "type"
+  | "observe"
+  | "pilot"
+  // flow control
+  | "checkpoint"
+  | "artifact"
+  | "none"
+  | "done";
+
+/** One concrete move the orchestrator executes this turn. */
+export interface UiAction {
+  tool: UiActionTool;
+  args: Record<string, unknown>;
+  rationale?: string;
+}
+
+/** An interactive element worth referencing or acting on. */
+export interface SalientElement {
+  ref: string;
+  role: string;
+  text: string;
+}
+
+/** Recent turn in the director's rolling history (teacher | student | action). */
+export interface DirectorTurn {
+  role: "teacher" | "student" | "action";
+  text: string;
+}
+
+/** Lesson context the director reasons over (goal + milestones, NOT rigid steps). */
+export interface DirectorLessonCtx {
+  id: string;
+  title: string;
+  goal: string;
+  knowledge_base: string;
+  curriculum: string[];
+}
+
+/** The current browser screen the director reasons over. */
+export interface DirectorScreenCtx {
+  url: string;
+  title: string;
+  /** If present the director uses it as-is; else the sidecar interprets text+elements. */
+  summary?: string;
+  elements: SalientElement[];
+  text: string;
+}
+
+export interface DirectorConstraints {
+  allowlist: string[];
+  turn_budget_remaining: number;
+  /** From the speech-research track: whether GWM-1 can speak text (false today). */
+  can_speak: boolean;
+}
+
+export interface DirectRequest {
+  session_id: string;
+  turn: number;
+  lesson: DirectorLessonCtx;
+  screen: DirectorScreenCtx;
+  student_message: string;
+  history: DirectorTurn[];
+  constraints: DirectorConstraints;
+}
+
+export interface DirectResponse {
+  narration: string;
+  ui_action: UiAction;
+  screen_summary: string;
+  salient_elements: SalientElement[];
+  milestone: string;
+  done: boolean;
+}
+
+export interface ComposeRequest {
+  task: string;
+  topic: string;
+  audience?: string;
+  tone?: string;
+  constraints?: string;
+}
+
+export interface ComposeResponse {
+  prompt: string;
+  notes: string;
+}
+
+export interface PilotResult {
+  outcome: string;
+  success: boolean;
+}
+
 // ── Organ 4: Browser controller (Playwright / Stagehand / Browser Use) ─────
 
 export interface ObserveResult {
@@ -210,6 +339,19 @@ export interface BrowserController extends AdapterMeta {
   /** URL a human opens to take over (live view focused for input). */
   takeoverUrl(): Promise<string>;
   stop(): Promise<void>;
+
+  // ── DSPy intelligence (proxied to the same sidecar's /intelligence/* routes) ──
+  /**
+   * One director turn: POST /intelligence/direct. Returns the narration + the
+   * single ui_action the orchestrator executes this turn. Throws if the sidecar
+   * intelligence routes are unreachable — the orchestrator catches and (on the
+   * first turn) falls back to the lesson's fixed steps so class still happens.
+   */
+  direct(req: DirectRequest): Promise<DirectResponse>;
+  /** Compose one strong, reusable prompt: POST /intelligence/compose. */
+  compose(req: ComposeRequest): Promise<ComposeResponse>;
+  /** Run an open-ended browser goal via the ReAct BrowserPilot: POST /intelligence/pilot. */
+  pilot(goal: string, allowlist?: string[]): Promise<PilotResult>;
 }
 
 // ── Organ 6: Lesson engine ─────────────────────────────────────────────────
@@ -236,6 +378,16 @@ export interface Lesson {
   goal: string;
   personaPrompt: string;
   knowledgeBase: string;
+  /**
+   * Ordered milestones/beats the DSPy TeachingDirector aims for — the
+   * destination, NOT a rigid script. Derived from the step titles so the
+   * director and the legacy step loop stay in sync.
+   */
+  curriculum: string[];
+  /** Domains the shared browser may visit for the WHOLE lesson (director-mode allowlist). */
+  allowlist: string[];
+  /** Fixed teaching steps. The director ignores these; they remain the FALLBACK
+   *  path the orchestrator runs when the intelligence sidecar is unreachable. */
   steps: LessonStep[];
 }
 
@@ -254,10 +406,16 @@ export interface LessonEngine {
   current(sessionId: string): LessonRunState | undefined;
   /** Advance after a step completes; returns next state. */
   advance(sessionId: string): LessonRunState | undefined;
+  /** Force the run to its terminal (done) state — used by the director loop,
+   *  which ends on the director's `done` action rather than walking steps. */
+  complete(sessionId: string): LessonRunState | undefined;
   /** Record a human checkpoint answer; returns whether it passed. */
   answer(sessionId: string, response: string): { passed: boolean; feedback: string };
   /** Guardrail: is this domain allowed in the current step? */
   isAllowed(sessionId: string, url: string): boolean;
+  /** The domains the shared browser may visit for the session's lesson
+   *  (lesson-level allowlist), passed to the director + the sidecar pilot. */
+  allowlistFor(sessionId: string): string[];
 }
 
 export interface ArtifactRef {

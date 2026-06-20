@@ -43,19 +43,38 @@ import type {
   ArtifactRef,
   BotStatus,
   BrowserSessionInfo,
+  DirectResponse,
+  DirectorTurn,
   Env,
+  Lesson,
   LessonRunState,
   LessonStep,
+  ObserveResult,
   SessionRecord,
   ToolContext,
   ToolName,
   TranscriptLine,
+  UiAction,
 } from "@/types/contracts";
 
 // ── tunables ─────────────────────────────────────────────────────────────────
 
-const STEP_DELAY_MS = 700; // pause between steps so it feels live
+const STEP_DELAY_MS = 700; // pause between steps/turns so it feels live
 const ANSWER_TIMEOUT_MS = 120_000; // human-answer ceiling before fallback
+// Director loop: how many TeachingDirector turns before we force-complete the
+// class. The director also returns `done` once the lesson goal is met, and the
+// sidecar force-ends when turns_remaining hits 0 — this is the outer ceiling.
+const MAX_DIRECTOR_TURNS = 40;
+// The live GWM-1 avatar has NO inbound text/speech channel (verified by the
+// speech-research track): it ad-libs from persona + startScript + what it hears/
+// sees, and there is no supported "say" API. So narration is authoritative ON
+// SCREEN (transcript + caption StageEvents) and only GROUNDS the avatar via
+// sendContext — it is never depended on to be recited aloud. Flip to true only
+// if a real live say() mechanism is ever found.
+const AVATAR_CAN_SPEAK = false;
+// After this many CONSECUTIVE mid-loop director failures we end the loop rather
+// than spin — a turn-0 failure instead falls back to the fixed lesson steps.
+const MAX_DIRECTOR_FAILURES = 3;
 // Cadence of the always-on screenshot stream. ~1.4fps JPEG keeps the browser
 // reliably visible (the live-view iframe paints black for an unattended page)
 // while staying trivially cheap (~60–180KB/s on localhost).
@@ -95,6 +114,12 @@ interface SessionRuntime {
   takenOver: boolean;
   /** Set while the loop is blocked awaiting a human checkpoint answer. */
   awaitingAnswer: ((response: string) => void) | null;
+  /**
+   * Student messages that arrived OUTSIDE a checkpoint (live interjections).
+   * The director loop drains this each turn into `student_message` so the brain
+   * can react to questions mid-class. Resolved checkpoints bypass this queue.
+   */
+  studentInbox: string[];
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -128,6 +153,26 @@ async function safeCall<T>(fn: () => Promise<T>, fallback: T): Promise<T> {
     return fallback;
   }
 }
+
+// ── arg coercion for the director's open-shaped ui_action args ───────────────
+
+function argStr(v: unknown, fallback = ""): string {
+  return typeof v === "string" ? v : fallback;
+}
+
+function argStrList(v: unknown): string[] | undefined {
+  if (!Array.isArray(v)) return undefined;
+  const out = v.filter((x): x is string => typeof x === "string");
+  return out.length > 0 ? out : undefined;
+}
+
+/** Empty page summary used on cold start / when an observe() call fails. */
+const EMPTY_OBSERVE: ObserveResult = {
+  url: "",
+  title: "",
+  elements: [],
+  text: "",
+};
 
 // ── orchestrator construction ────────────────────────────────────────────────
 
@@ -284,6 +329,7 @@ function buildOrchestrator(env: Env): Orchestrator {
         stopped: false,
         takenOver: false,
         awaitingAnswer: null,
+        studentInbox: [],
       };
       runtimes.set(sessionId, rt);
     }
@@ -385,14 +431,12 @@ function buildOrchestrator(env: Env): Orchestrator {
 
   // ── checkpoint resolution (auto vs human) ─────────────────────────────────
 
-  function resolveCheckpoint(
-    rt: SessionRuntime,
-    cp: NonNullable<LessonStep["checkpoint"]>,
-  ): Promise<string> {
-    const fallback = cp.expects ?? cp.choices?.[0] ?? "yes";
-
-    // Park the loop until a human answer() signals, with a timeout fallback so a
-    // silent classroom never hangs forever. There is no auto-resolve.
+  /**
+   * Park the loop until a human answer() signals, with a timeout fallback so a
+   * silent classroom never hangs forever. Shared by the legacy step checkpoints
+   * and the director's `checkpoint` action. There is no auto-resolve.
+   */
+  function parkForAnswer(rt: SessionRuntime, fallback: string): Promise<string> {
     return new Promise<string>((resolve) => {
       let settled = false;
       const finish = (value: string) => {
@@ -404,6 +448,13 @@ function buildOrchestrator(env: Env): Orchestrator {
       rt.awaitingAnswer = (response) => finish(response);
       setTimeout(() => finish(fallback), ANSWER_TIMEOUT_MS);
     });
+  }
+
+  function resolveCheckpoint(
+    rt: SessionRuntime,
+    cp: NonNullable<LessonStep["checkpoint"]>,
+  ): Promise<string> {
+    return parkForAnswer(rt, cp.expects ?? cp.choices?.[0] ?? "yes");
   }
 
   async function handleCheckpoint(
@@ -450,6 +501,338 @@ function buildOrchestrator(env: Env): Orchestrator {
           await handleCheckpoint(sessionId, rt, step.checkpoint);
         }
         break;
+    }
+  }
+
+  // ── director loop (DSPy TeachingDirector drives every turn) ───────────────
+
+  /**
+   * Ground the live avatar with the director's intent for this turn. GWM-1 has
+   * NO inbound text channel, so this is the ONLY supported lever (best-effort
+   * sendContext) — it nudges the avatar's ad-lib toward the current beat. The
+   * exact teaching CONTENT is shown on screen via the transcript StageEvent
+   * (narrateTeacher), never depended on to be recited by the avatar.
+   */
+  async function groundAvatar(
+    sessionId: string,
+    resp: DirectResponse,
+  ): Promise<void> {
+    const grounding = [
+      resp.milestone ? `Current focus: ${resp.milestone}.` : "",
+      resp.screen_summary ? `On screen: ${resp.screen_summary}` : "",
+      resp.narration ? `Teaching point: ${resp.narration}` : "",
+    ]
+      .filter(Boolean)
+      .join(" ");
+    if (grounding) {
+      await safe(() => character.sendContext(sessionId, grounding));
+    }
+  }
+
+  /**
+   * Execute the director's single chosen ui_action. Browser/flow/output verbs map
+   * onto EXISTING tool-registry handlers (so the StageEvent + ToolName contracts
+   * are untouched); on-stage overlay verbs with no existing handler are emitted
+   * as the additive `ui_action` StageEvent for the overlay UI to route. The
+   * allowlist is enforced again inside browser_open + the sidecar (defence in
+   * depth). `done`/`checkpoint`/`none` are handled by the loop, not here.
+   */
+  async function executeUiAction(
+    sessionId: string,
+    action: UiAction,
+    allowlist: string[],
+  ): Promise<void> {
+    const args = action.args ?? {};
+    switch (action.tool) {
+      // ── browser actuation (existing browser_* handlers) ──
+      case "navigate":
+        await dispatchTool(sessionId, "browser_open", args);
+        return;
+      case "click":
+        await dispatchTool(sessionId, "browser_click", args);
+        return;
+      case "type":
+        await dispatchTool(sessionId, "browser_type", args);
+        return;
+      case "observe":
+        await dispatchTool(sessionId, "browser_observe", {});
+        return;
+      case "pilot": {
+        const goal = argStr(args.goal);
+        if (!goal) return;
+        const result = await safeCall(() => browser.pilot(goal, allowlist), {
+          outcome: "pilot unavailable",
+          success: false,
+        });
+        publish(sessionId, {
+          type: "output",
+          text: result.outcome,
+          source: "pilot",
+        });
+        return;
+      }
+      // ── output / prompt / artifact (existing handlers) ──
+      case "write_prompt":
+        await dispatchTool(sessionId, "write_prompt", args);
+        return;
+      case "show_output":
+        await dispatchTool(sessionId, "show_output", args);
+        return;
+      case "highlight":
+        await dispatchTool(sessionId, "highlight_area", args);
+        return;
+      case "artifact":
+        await dispatchTool(sessionId, "save_artifact", args);
+        return;
+      // ── on-stage overlays with no existing StageEvent: emit the additive one ──
+      case "caption":
+      case "zoom":
+      case "spotlight":
+      case "arrow":
+      case "circle":
+      case "scroll_to":
+      case "share_screen":
+      case "take_control":
+      case "clear_overlay":
+        publish(sessionId, { type: "ui_action", tool: action.tool, args });
+        return;
+      // ── handled by the loop; nothing to actuate here ──
+      case "checkpoint":
+      case "done":
+      case "none":
+        return;
+      default:
+        // Unknown verb (the brain validates to a closed set, but stay safe):
+        // surface it as a generic ui_action rather than dropping it silently.
+        publish(sessionId, {
+          type: "ui_action",
+          tool: String(action.tool),
+          args,
+        });
+        return;
+    }
+  }
+
+  /** The director asked a question: emit it, park for a real human answer. */
+  async function directorCheckpoint(
+    sessionId: string,
+    rt: SessionRuntime,
+    args: Record<string, unknown>,
+  ): Promise<string> {
+    const question = argStr(args.question, "Shall we continue?");
+    const choices = argStrList(args.choices);
+    publish(sessionId, { type: "checkpoint", question, choices });
+    const answer = await parkForAnswer(rt, choices?.[0] ?? "yes");
+    if (!rt.stopped) await narrateHuman(sessionId, answer);
+    return answer;
+  }
+
+  /**
+   * Build the per-turn DirectorScreenCtx from a fresh observe(). Sent raw (text +
+   * elements) so the sidecar's ScreenInterpreter produces the summary server-side
+   * (the ScreenInterpreter is reachable through /direct, no separate endpoint).
+   */
+  function toScreenCtx(o: ObserveResult) {
+    return {
+      url: o.url,
+      title: o.title,
+      elements: o.elements,
+      text: o.text,
+    };
+  }
+
+  /**
+   * The canonical teaching loop: the DSPy TeachingDirector chooses one move per
+   * turn toward the lesson GOAL (curriculum = milestones, not a script). Bounded
+   * by MAX_DIRECTOR_TURNS, pausable by human takeover, parking on checkpoints,
+   * ending on the director's `done`. Returns { ran:false } ONLY when the
+   * intelligence sidecar is unreachable on turn 0, so runSession can fall back to
+   * the lesson's fixed steps and still hold class.
+   */
+  async function runDirectorLoop(
+    sessionId: string,
+    rt: SessionRuntime,
+    lesson: Lesson,
+    lessonId: string,
+  ): Promise<{ ran: boolean }> {
+    const allowlist = lessons.allowlistFor(sessionId);
+    const history: DirectorTurn[] = [];
+    let turn = 0;
+    let stepCounter = -1;
+    let lastMilestone = "";
+    let failures = 0;
+
+    // Bring the shared browser live so the director has a real screen to read
+    // and can navigate from turn 0 (idempotent — consumes the prewarm).
+    const info = await safeCall(() => ensureBrowserLive(sessionId), null);
+    if (info) {
+      publish(sessionId, { type: "browser_view", liveUrl: info.liveViewUrl });
+    }
+
+    while (!rt.stopped && turn < MAX_DIRECTOR_TURNS) {
+      if (rt.takenOver) {
+        // Human is driving — pause the director without burning the budget.
+        await delay(STEP_DELAY_MS);
+        continue;
+      }
+
+      // Drain any live student interjections captured since the last turn.
+      const studentMessage = rt.studentInbox.splice(0).join("\n").trim();
+      if (studentMessage) history.push({ role: "student", text: studentMessage });
+
+      // 1) Read the current screen (empty on cold start / on transient failure).
+      const screen = await safeCall(() => browser.observe(), EMPTY_OBSERVE);
+
+      // 2) Ask the director for the next move.
+      let resp: DirectResponse;
+      try {
+        resp = await browser.direct({
+          session_id: sessionId,
+          turn,
+          lesson: {
+            id: lessonId,
+            title: lesson.title,
+            goal: lesson.goal,
+            knowledge_base: lesson.knowledgeBase,
+            curriculum: lesson.curriculum,
+          },
+          screen: toScreenCtx(screen),
+          student_message: studentMessage,
+          history: history.slice(-12),
+          constraints: {
+            allowlist,
+            turn_budget_remaining: MAX_DIRECTOR_TURNS - turn,
+            can_speak: AVATAR_CAN_SPEAK,
+          },
+        });
+      } catch (err) {
+        if (turn === 0) {
+          // Brain never reached — let runSession fall back to fixed steps.
+          publish(sessionId, {
+            type: "status",
+            phase: "teaching",
+            detail: `director unavailable, using lesson steps: ${errMsg(err)}`,
+          });
+          return { ran: false };
+        }
+        // Mid-loop hiccup — skip the turn, keep the class alive.
+        failures += 1;
+        if (failures >= MAX_DIRECTOR_FAILURES) {
+          publish(sessionId, {
+            type: "status",
+            phase: "teaching",
+            detail: "director failing repeatedly; ending loop",
+          });
+          break;
+        }
+        turn += 1;
+        await delay(STEP_DELAY_MS);
+        continue;
+      }
+      failures = 0;
+      if (rt.stopped) break;
+
+      // 3) Narration is authoritative ON SCREEN (transcript) + grounds the avatar.
+      await narrateTeacher(sessionId, resp.narration);
+      if (resp.narration.trim()) {
+        history.push({ role: "teacher", text: resp.narration });
+      }
+      await groundAvatar(sessionId, resp);
+
+      // Step timeline: one entry per milestone change (keeps it readable).
+      if (resp.milestone && resp.milestone !== lastMilestone) {
+        lastMilestone = resp.milestone;
+        stepCounter += 1;
+        publish(sessionId, {
+          type: "step",
+          index: stepCounter,
+          title: resp.milestone,
+          body: resp.narration,
+        });
+      }
+
+      const action = resp.ui_action;
+      await safe(() =>
+        repo.appendTrace(sessionId, {
+          ts: Date.now(),
+          kind: "director_turn",
+          data: { turn, milestone: resp.milestone, action },
+        }),
+      );
+
+      // 4) Terminal / fork / actuate.
+      if (action.tool === "done" || resp.done) break;
+      if (action.tool === "checkpoint") {
+        const answer = await directorCheckpoint(sessionId, rt, action.args ?? {});
+        history.push({ role: "student", text: answer });
+        if (rt.stopped) break;
+        turn += 1;
+        await delay(STEP_DELAY_MS);
+        continue;
+      }
+      await executeUiAction(sessionId, action, allowlist);
+      history.push({
+        role: "action",
+        text: `${action.tool} ${JSON.stringify(action.args ?? {})}`,
+      });
+
+      await safe(() =>
+        repo.saveProgress(
+          sessionId,
+          lessons.current(sessionId) ??
+            lessons.start(lessonId, sessionId),
+        ),
+      );
+
+      turn += 1;
+      await delay(STEP_DELAY_MS);
+    }
+
+    if (turn >= MAX_DIRECTOR_TURNS) {
+      publish(sessionId, {
+        type: "status",
+        phase: "teaching",
+        detail: "reached max director turns",
+      });
+    }
+    return { ran: true };
+  }
+
+  /**
+   * FALLBACK teaching loop: the original fixed-step LessonEngine walk, used only
+   * when the intelligence sidecar is unreachable so a live class still happens.
+   * Mirrors the pre-director behaviour exactly (narrate → tool/checkpoint/say,
+   * advance, persist) minus the final done-flip, which the unified completion in
+   * runSession performs via lessons.complete().
+   */
+  async function runLegacyLessonLoop(
+    sessionId: string,
+    rt: SessionRuntime,
+    lesson: Lesson,
+    lessonId: string,
+    fallbackState: LessonRunState,
+  ): Promise<void> {
+    const steps = lesson.steps;
+    // Restart the engine at step 0 so the walk + isAllowed track the steps.
+    lessons.start(lessonId, sessionId);
+    for (let i = 0; i < steps.length; i++) {
+      if (rt.stopped) break;
+      const step = steps[i];
+      publish(sessionId, {
+        type: "step",
+        index: i,
+        title: step.title,
+        body: step.say,
+      });
+      await processStep(sessionId, rt, step);
+      await safe(() =>
+        repo.saveProgress(sessionId, lessons.current(sessionId) ?? fallbackState),
+      );
+      if (rt.stopped) break;
+      if (i < steps.length - 1) {
+        lessons.advance(sessionId);
+        await delay(STEP_DELAY_MS);
+      }
     }
   }
 
@@ -582,37 +965,27 @@ function buildOrchestrator(env: Env): Orchestrator {
         }
         if (rt.stopped) return;
 
-        // 4) Step the LessonEngine. The engine's internal index is kept in
-        //    lockstep with `i` (advance after each step) so isAllowed reflects
-        //    the step currently executing.
+        // 4) DIRECTOR-DRIVEN teaching loop. The lesson supplies the GOAL +
+        //    curriculum (milestones); the DSPy TeachingDirector decides each
+        //    move (narration + one ui_action) which the orchestrator actuates
+        //    through the existing tool registry / StageEvent emitters. If the
+        //    intelligence sidecar is unreachable on the FIRST turn we fall back
+        //    to the lesson's fixed steps so a live class still happens.
         await safe(() => repo.updateSession(sessionId, { phase: "teaching" }));
         publish(sessionId, { type: "status", phase: "teaching" });
 
-        const steps = lesson.steps;
         const fallbackState =
           lessons.current(sessionId) ?? lessons.start(lessonId, sessionId);
 
-        for (let i = 0; i < steps.length; i++) {
-          if (rt.stopped) break;
-          const step = steps[i];
-          publish(sessionId, {
-            type: "step",
-            index: i,
-            title: step.title,
-            body: step.say,
-          });
-          await processStep(sessionId, rt, step);
-          await safe(() =>
-            repo.saveProgress(
-              sessionId,
-              lessons.current(sessionId) ?? fallbackState,
-            ),
+        const { ran } = await runDirectorLoop(sessionId, rt, lesson, lessonId);
+        if (!ran && !rt.stopped) {
+          await runLegacyLessonLoop(
+            sessionId,
+            rt,
+            lesson,
+            lessonId,
+            fallbackState,
           );
-          if (rt.stopped) break;
-          if (i < steps.length - 1) {
-            lessons.advance(sessionId);
-            await delay(STEP_DELAY_MS);
-          }
         }
 
         if (rt.stopped) {
@@ -625,7 +998,9 @@ function buildOrchestrator(env: Env): Orchestrator {
         }
 
         // 5) Mark the lesson done + persist + record the learning + complete.
-        lessons.advance(sessionId); // flips done = true
+        //    The director ends on its own `done`; complete() flips done = true
+        //    for both the director and the legacy-fallback paths.
+        lessons.complete(sessionId);
         await safe(() =>
           repo.saveProgress(
             sessionId,
@@ -657,15 +1032,17 @@ function buildOrchestrator(env: Env): Orchestrator {
     },
 
     async answer(sessionId, response) {
-      const rt = runtimes.get(sessionId);
-      if (rt?.awaitingAnswer) {
+      const rt = ensureRuntime(sessionId);
+      if (rt.awaitingAnswer) {
         const signal = rt.awaitingAnswer;
         rt.awaitingAnswer = null;
         signal(response);
         return;
       }
-      // No checkpoint is currently waiting — still log the human turn so the
-      // transcript reflects the interjection.
+      // No checkpoint is currently waiting — this is a live interjection. Queue
+      // it so the director picks it up as `student_message` next turn, and log
+      // the human turn so the transcript reflects it immediately.
+      rt.studentInbox.push(response);
       await narrateHuman(sessionId, response);
     },
 
