@@ -21,3 +21,9 @@ browser_agent/.venv/
 
 # tooling
 .commandcode/
+
+# secrets & local keys
+src/server/keysstored*
+
+# generated artifacts
+public/artifacts/

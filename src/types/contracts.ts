@@ -38,7 +38,8 @@ export type ToolName =
   | "browser_task"
   | "browser_screenshot"
   | "browser_takeover_url"
-  | "browser_stop";
+  | "browser_stop"
+  | "browser_run_skill";
 
 export interface ToolCall {
   id: string;
@@ -220,6 +221,7 @@ export type UiActionTool =
   | "type"
   | "observe"
   | "pilot"
+  | "run_skill"
   // flow control
   | "checkpoint"
   | "artifact"
@@ -323,8 +325,9 @@ export interface BrowserController extends AdapterMeta {
   attach(info: BrowserSessionInfo): Promise<void>;
   open(url: string): Promise<void>;
   observe(): Promise<ObserveResult>;
-  click(instruction: string): Promise<void>;
-  type(text: string): Promise<void>;
+  click(instruction: string, index?: number): Promise<void>;
+  type(text: string, index?: number): Promise<void>;
+  runSkill(name: string, args?: Record<string, unknown>): Promise<void>;
   /** Open-ended goal handled by Browser Use; bounded by allowlist. */
   task(goal: string): Promise<{ summary: string; ok: boolean }>;
   screenshot(): Promise<string>;

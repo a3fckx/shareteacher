@@ -571,6 +571,9 @@ function buildOrchestrator(env: Env): Orchestrator {
         });
         return;
       }
+      case "run_skill":
+        await dispatchTool(sessionId, "browser_run_skill", args);
+        return;
       // ── output / prompt / artifact (existing handlers) ──
       case "write_prompt":
         await dispatchTool(sessionId, "write_prompt", args);

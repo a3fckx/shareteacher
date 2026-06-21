@@ -107,8 +107,8 @@ function createRealRuntime(env: Env): BrowserRuntime {
   }
 
   // A named persistent profile requires a Kernel paid plan (Hobbyist+); on the
-  // free plan the create fails with this signature and we degrade to profileless.
-  const PLAN_GATED = /insufficient_plan|profiles? require|paid plan/i;
+  // free/unpaid plan the create fails with this signature and we degrade to profileless.
+  const PLAN_GATED = /insufficient_plan|profiles? require|paid plan|payment method/i;
 
   return {
     name: ADAPTER_NAME,

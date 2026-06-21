@@ -63,6 +63,7 @@ UiTool = Literal[
     "type",
     "observe",
     "pilot",
+    "run_skill",
     # flow control
     "checkpoint",
     "artifact",
@@ -78,7 +79,7 @@ NAVIGATION_TOOLS: frozenset[str] = frozenset({"navigate", "pilot"})
 
 # Verbs that drive the real browser (vs. pure on-stage presentation).
 BROWSER_TOOLS: frozenset[str] = frozenset(
-    {"navigate", "click", "type", "observe", "pilot"}
+    {"navigate", "click", "type", "observe", "pilot", "run_skill"}
 )
 
 
@@ -105,10 +106,11 @@ class UiAction(BaseModel):
       show_output  {text:str, source?:str}
       write_prompt {text:str, target?:"chatgpt"|"generic"}
       navigate     {url:str}                      # allowlist-enforced
-      click        {instruction:str}
-      type         {text:str, submit?:bool}
+      click        {instruction:str, index?:int}  # provide index from salient_elements for 10x speedup
+      type         {text:str, index?:int, submit?:bool} # provide index from salient_elements for 10x speedup
       observe      {}
       pilot        {goal:str, maxSteps?:int}       # allowlist-enforced
+      run_skill    {name:str, args?:dict}
       checkpoint   {question:str, choices?:[str]}
       artifact     {kind:str, name:str, text?:str, topic?:str}
       none         {}

@@ -148,20 +148,29 @@ export function createRealBrowserController(env: Env): BrowserController {
       };
     },
 
-    async click(instruction: string): Promise<void> {
+    async click(instruction: string, index?: number): Promise<void> {
       await call(
         "POST",
         "/click",
-        { sessionId: sessionId(), instruction },
+        { sessionId: sessionId(), instruction, index },
         DEFAULT_TIMEOUT_MS,
       );
     },
 
-    async type(text: string): Promise<void> {
+    async type(text: string, index?: number): Promise<void> {
       await call(
         "POST",
         "/type",
-        { sessionId: sessionId(), text: text ?? "" },
+        { sessionId: sessionId(), text: text ?? "", index },
+        DEFAULT_TIMEOUT_MS,
+      );
+    },
+
+    async runSkill(name: string, args: Record<string, unknown> = {}): Promise<void> {
+      await call(
+        "POST",
+        "/run_skill",
+        { sessionId: sessionId(), name, args },
         DEFAULT_TIMEOUT_MS,
       );
     },

@@ -1,3 +1,11 @@
+if (typeof globalThis !== "undefined" && globalThis.localStorage && !globalThis.localStorage.getItem) {
+  try {
+    delete (globalThis as any).localStorage;
+  } catch (e) {
+    // ignore
+  }
+}
+
 import type { Env } from "@/types/contracts";
 
 let cached: Env | null = null;

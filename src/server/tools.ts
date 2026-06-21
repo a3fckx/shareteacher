@@ -200,19 +200,29 @@ const browserObserve: ToolHandler = async (_args, ctx) => {
 const browserClick: ToolHandler = async (args, ctx) => {
   const instruction =
     str(args.instruction) || str(args.target) || str(args.text) || "click";
-  await ctx.browser.click(instruction);
+  const index = typeof args.index === "number" ? args.index : undefined;
+  await ctx.browser.click(instruction, index);
   // The always-on screenshot stream reflects the click result; no extra shot.
-  return { clicked: instruction };
+  return { clicked: instruction, index };
 };
 
 const browserType: ToolHandler = async (args, ctx) => {
   const text = str(args.text);
-  await ctx.browser.type(text);
+  const index = typeof args.index === "number" ? args.index : undefined;
+  await ctx.browser.type(text, index);
   if (args.submit === true) {
     await ctx.browser.click("send");
   }
   // The always-on screenshot stream reflects the typed text / submit result.
-  return { typed: text, submitted: args.submit === true };
+  return { typed: text, index, submitted: args.submit === true };
+};
+
+const browserRunSkill: ToolHandler = async (args, ctx) => {
+  const name = str(args.name);
+  if (!name) throw new Error("browser_run_skill requires a 'name'");
+  const skillArgs = (args.args as Record<string, unknown>) || {};
+  await ctx.browser.runSkill(name, skillArgs);
+  return { name, args: skillArgs };
 };
 
 const browserTask: ToolHandler = async (args, ctx) => {
@@ -242,7 +252,7 @@ const browserStop: ToolHandler = async (_args, ctx) => {
 
 // ── registry ─────────────────────────────────────────────────────────────────
 
-/** All 15 tools, keyed by ToolName. The orchestrator routes every call here. */
+/** All 16 tools, keyed by ToolName. The orchestrator routes every call here. */
 export const toolRegistry: Record<ToolName, ToolHandler> = {
   // client/UI
   show_step: showStep,
@@ -261,6 +271,7 @@ export const toolRegistry: Record<ToolName, ToolHandler> = {
   browser_screenshot: browserScreenshot,
   browser_takeover_url: browserTakeoverUrl,
   browser_stop: browserStop,
+  browser_run_skill: browserRunSkill,
 };
 
 /** Every ToolName, derived from the registry so the two can never drift. */

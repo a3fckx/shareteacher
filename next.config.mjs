@@ -1,3 +1,11 @@
+if (typeof globalThis !== "undefined" && globalThis.localStorage && !globalThis.localStorage.getItem) {
+  try {
+    delete globalThis.localStorage;
+  } catch (e) {
+    // ignore
+  }
+}
+
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   reactStrictMode: true,
@@ -9,3 +17,4 @@ const nextConfig = {
 };
 
 export default nextConfig;
+

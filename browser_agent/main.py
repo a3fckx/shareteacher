@@ -77,11 +77,19 @@ class OpenReq(BaseModel):
 class ClickReq(BaseModel):
     sessionId: str = "default"
     instruction: str
+    index: Optional[int] = None
 
 
 class TypeReq(BaseModel):
     sessionId: str = "default"
     text: str = ""
+    index: Optional[int] = None
+
+
+class RunSkillReq(BaseModel):
+    sessionId: str = "default"
+    name: str
+    args: dict[str, Any] = {}
 
 
 class TaskReq(BaseModel):
@@ -268,6 +276,16 @@ async def observe(sessionId: str = "default") -> dict[str, Any]:
 async def click(req: ClickReq) -> dict[str, Any]:
     handle = _handle(req.sessionId)
     async with handle.lock:
+        if req.index is not None:
+            state = await handle.browser.get_browser_state_summary(include_screenshot=False)
+            node = _selector_map(state).get(int(req.index))
+            if node is not None:
+                from browser_use.browser.events import ClickElementEvent
+                ev = handle.browser.event_bus.dispatch(ClickElementEvent(node=node))
+                await ev
+                await ev.event_result(raise_if_any=True, raise_if_none=False)
+                return {"ok": True, "clicked": f"index:{req.index}"}
+
         await _run_agent(
             handle,
             f"Click the element described as: {req.instruction}. "
@@ -281,6 +299,18 @@ async def click(req: ClickReq) -> dict[str, Any]:
 async def type_text(req: TypeReq) -> dict[str, Any]:
     handle = _handle(req.sessionId)
     async with handle.lock:
+        if req.index is not None:
+            state = await handle.browser.get_browser_state_summary(include_screenshot=False)
+            node = _selector_map(state).get(int(req.index))
+            if node is not None:
+                from browser_use.browser.events import TypeTextEvent
+                ev = handle.browser.event_bus.dispatch(
+                    TypeTextEvent(node=node, text=req.text, clear=True)
+                )
+                await ev
+                await ev.event_result(raise_if_any=True, raise_if_none=False)
+                return {"ok": True, "typed": f"index:{req.index}"}
+
         await _run_agent(
             handle,
             "Type the following text into the most relevant text input on the "
@@ -289,6 +319,19 @@ async def type_text(req: TypeReq) -> dict[str, Any]:
             max_steps=4,
         )
     return {"ok": True}
+
+
+@app.post("/run_skill")
+async def run_skill(req: RunSkillReq) -> dict[str, Any]:
+    handle = _handle(req.sessionId)
+    async with handle.lock:
+        from skills import run_skill_by_name
+        try:
+            result = await run_skill_by_name(req.name, handle.browser, **req.args)
+            return {"ok": True, "result": result}
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc))
+
 
 
 @app.post("/task")
