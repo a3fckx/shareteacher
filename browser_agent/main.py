@@ -107,7 +107,7 @@ class StopReq(BaseModel):
 
 def _llm() -> "ChatOpenAI":
     # Uses OPENAI_API_KEY from the environment (loaded from ../.env.local).
-    return ChatOpenAI(model=os.getenv("BROWSER_AGENT_MODEL", "gpt-4.1-mini"))
+    return ChatOpenAI(model=os.getenv("BROWSER_AGENT_MODEL", "gpt-5-mini-2025-08-07"))
 
 
 def _handle(session_id: str) -> Handle:

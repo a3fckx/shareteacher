@@ -21,7 +21,6 @@ from __future__ import annotations
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException
-from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 
 from .programs import (
@@ -144,7 +143,7 @@ def _format_elements(elements: List[Dict[str, Any]], limit: int = 12) -> str:
 
 
 @router.post("/direct", response_model=DirectResponse)
-def direct(req: DirectRequest) -> DirectResponse:
+async def direct(req: DirectRequest) -> DirectResponse:
     """One director turn: choose narration + a single ui_action."""
     _ensure_lm()
 
@@ -152,7 +151,7 @@ def direct(req: DirectRequest) -> DirectResponse:
     summary = req.screen.summary or ""
     salient: List[SalientElement] = []
     if not summary and (req.screen.text or req.screen.elements):
-        view = _interpreter(
+        view = await _interpreter.acall(
             url=req.screen.url,
             title=req.screen.title,
             page_text=req.screen.text,
@@ -170,7 +169,7 @@ def direct(req: DirectRequest) -> DirectResponse:
     )
 
     # 2) Direct.
-    pred = _director(
+    pred = await _director.acall(
         lesson_goal=req.lesson.goal,
         lesson_knowledge=req.lesson.knowledge_base,
         curriculum="\n".join(f"- {b}" for b in req.lesson.curriculum) or "(open)",
@@ -211,9 +210,9 @@ class ComposeResponse(BaseModel):
 
 
 @router.post("/compose", response_model=ComposeResponse)
-def compose(req: ComposeRequest) -> ComposeResponse:
+async def compose(req: ComposeRequest) -> ComposeResponse:
     _ensure_lm()
-    pred = _composer(
+    pred = await _composer.acall(
         task=req.task,
         topic=req.topic,
         audience=req.audience,
@@ -253,9 +252,8 @@ async def interpret(req: InterpretRequest) -> InterpretResponse:
     elements = obs.get("elements") or []
     text = str(obs.get("text", "") or "")
 
-    # The LM call is synchronous; run it off the event loop so /frame keeps flowing.
-    view = await run_in_threadpool(
-        _interpreter,
+    # The LM call is async; we call it directly.
+    view = await _interpreter.acall(
         url=url,
         title=title,
         page_text=text,

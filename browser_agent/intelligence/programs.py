@@ -53,21 +53,36 @@ def configure_lm(model: Optional[str] = None) -> dspy.LM:
     """Build + globally configure the DSPy LM backend (OpenAI).
 
     Idempotent enough to call once at service startup. Model precedence:
-    explicit arg -> DSPY_MODEL -> BROWSER_AGENT_MODEL -> gpt-4.1-mini.
+    explicit arg -> DSPY_MODEL -> BROWSER_AGENT_MODEL -> gpt-5-mini-2025-08-07.
     """
     chosen = (
         model
         or os.getenv("DSPY_MODEL")
         or os.getenv("BROWSER_AGENT_MODEL")
-        or "gpt-4.1-mini"
+        or "gpt-5-mini-2025-08-07"
     )
+    # Check if the chosen model is considered an OpenAI reasoning model
+    import re
+    model_family = chosen.split("/")[-1].lower()
+    is_reasoning = re.match(
+        r"^(?:o[1345](?:-(?:mini|nano|pro))?(?:-\d{4}-\d{2}-\d{2})?|gpt-5(?!-chat)(?:-.*)?)$",
+        model_family,
+    )
+    if is_reasoning:
+        # OpenAI reasoning models require temperature=1.0 or None, and max_tokens >= 16000 or None
+        temperature = 1.0
+        max_tokens = 16000
+    else:
+        temperature = float(os.getenv("DSPY_TEMPERATURE", "0.3"))
+        max_tokens = int(os.getenv("DSPY_MAX_TOKENS", "1024"))
+
     # dspy.LM is litellm-backed; "openai/<model>" routes to the OpenAI provider
     # and reads OPENAI_API_KEY from the environment.
     lm = dspy.LM(
         f"openai/{chosen}" if "/" not in chosen else chosen,
         api_key=os.getenv("OPENAI_API_KEY"),
-        temperature=float(os.getenv("DSPY_TEMPERATURE", "0.3")),
-        max_tokens=int(os.getenv("DSPY_MAX_TOKENS", "1024")),
+        temperature=temperature,
+        max_tokens=max_tokens,
     )
     dspy.configure(lm=lm)
     return lm
@@ -133,14 +148,14 @@ class ScreenInterpreter(dspy.Module):
         super().__init__()
         self.interpret = dspy.ChainOfThought(ScreenInterpret)
 
-    def forward(
+    async def aforward(
         self,
         url: str,
         title: str,
         page_text: str,
         elements: Optional[List[Dict[str, Any]]] = None,
     ) -> dspy.Prediction:
-        return self.interpret(
+        return await self.interpret.acall(
             url=url or "",
             title=title or "",
             page_text=(page_text or "")[:8000],
@@ -159,7 +174,7 @@ class TeachingDirector(dspy.Module):
         super().__init__()
         self.direct = dspy.ChainOfThought(DirectTeaching)
 
-    def forward(
+    async def aforward(
         self,
         lesson_goal: str,
         lesson_knowledge: str,
@@ -172,7 +187,7 @@ class TeachingDirector(dspy.Module):
         can_speak: bool,
         turns_remaining: int,
     ) -> dspy.Prediction:
-        pred = self.direct(
+        pred = await self.direct.acall(
             lesson_goal=lesson_goal,
             lesson_knowledge=lesson_knowledge,
             curriculum=curriculum,
@@ -201,7 +216,7 @@ class PromptComposer(dspy.Module):
         super().__init__()
         self.compose = dspy.ChainOfThought(ComposePrompt)
 
-    def forward(
+    async def aforward(
         self,
         task: str,
         topic: str,
@@ -209,7 +224,7 @@ class PromptComposer(dspy.Module):
         tone: str = "",
         constraints: str = "",
     ) -> dspy.Prediction:
-        return self.compose(
+        return await self.compose.acall(
             task=task,
             topic=topic,
             audience=audience,

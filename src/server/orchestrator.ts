@@ -266,12 +266,16 @@ function buildOrchestrator(env: Env): Orchestrator {
     if (inflight) return inflight;
     const p = (async () => {
       const warm = warmBrowsers.get(sessionId);
+      console.info(`[orchestrator] ensureBrowserLive(${sessionId}): ${warm ? "consuming prewarm" : "cold start"}`);
       const info = warm
         ? await warm
         : await browserRuntime.startSession(env.kernel.profileName);
+      console.info(`[orchestrator] Kernel browser ready: session=${info.sessionId}, cdp=${Boolean(info.cdpUrl)}, liveView=${Boolean(info.liveViewUrl)}`);
       if (!attachedSet.has(sessionId)) {
+        console.info(`[orchestrator] Attaching sidecar to CDP url for session ${sessionId}...`);
         await browser.attach(info);
         attachedSet.add(sessionId);
+        console.info(`[orchestrator] Sidecar attached successfully for session ${sessionId}`);
       }
       await safe(() =>
         repo.updateSession(sessionId, { browserSessionId: info.sessionId }),
@@ -280,7 +284,10 @@ function buildOrchestrator(env: Env): Orchestrator {
       return info;
     })();
     liveSessions.set(sessionId, p);
-    p.catch(() => liveSessions.delete(sessionId));
+    p.catch((err) => {
+      console.error(`[orchestrator] ensureBrowserLive(${sessionId}) FAILED:`, errMsg(err));
+      liveSessions.delete(sessionId);
+    });
     return p;
   }
 
@@ -667,7 +674,18 @@ function buildOrchestrator(env: Env): Orchestrator {
 
     // Bring the shared browser live so the director has a real screen to read
     // and can navigate from turn 0 (idempotent — consumes the prewarm).
-    const info = await safeCall(() => ensureBrowserLive(sessionId), null);
+    let info: BrowserSessionInfo | null = null;
+    try {
+      info = await ensureBrowserLive(sessionId);
+    } catch (err) {
+      const msg = errMsg(err);
+      console.error(`[orchestrator] browser failed to come live for director loop:`, msg);
+      publish(sessionId, {
+        type: "status",
+        phase: "teaching",
+        detail: `browser failed to come live: ${msg}`,
+      });
+    }
     if (info) {
       publish(sessionId, { type: "browser_view", liveUrl: info.liveViewUrl });
     }
